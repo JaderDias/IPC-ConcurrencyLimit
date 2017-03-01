@@ -42,7 +42,9 @@ sub _print {
     diag $msg
         if $debug;
 };
+my $max_procs = 2;
 my %shared_opt = (
+  max_procs => $max_procs,
   path => $tmpdir,
   poll_time => 0.1,
   debug_sub => sub { _print( "pid: $$: ", @_) },
@@ -79,21 +81,21 @@ SCOPE: {
         }
     };
 
-    my $worker= $child_process->();
-    is(waitpid($worker,WNOHANG),0,"first worker running");
-   
+    my @workers= map $child_process->(0.5, $max_procs), 1..$max_procs;
+    is_deeply([ map waitpid($_,WNOHANG), @workers ], [ (0) x $max_procs ],"first worker(s) running");
+
     for (1..3) {
-        my $new_worker= $child_process->(0.5,2);
-        is(waitpid($new_worker,WNOHANG), 0, "new worker running");
-        is(waitpid($worker,WNOHANG), $worker, "old worker stopped")
+        my @new_workers= map $child_process->(0.5,2), @workers;
+        is_deeply([ map waitpid($_,WNOHANG), @new_workers ], [ (0) x $max_procs ], "new worker(s) running");
+        is_deeply([ map waitpid($_,WNOHANG), @workers     ], \@workers           , "old worker(s) stopped")
             or die "Stopping...\n";
-        $worker= $new_worker;
+        @workers = @new_workers;
     }
 
     $limit->release_lock();
     diag "sleeping after releasing master lock" if $debug;
     sleep(3); 
-    is(waitpid($worker,WNOHANG), $worker, "last worker exited after master release_lock");
+    is_deeply([ map waitpid($_,WNOHANG), @workers ], \@workers, "last worker exited after master release_lock");
 
     my @pids;
     diag "starting 1..30 loop" if $debug;
@@ -103,7 +105,7 @@ SCOPE: {
             or next;
         push @pids, $pid;
         @pids= grep { 
-            my $wait_res= waitpid($worker,WNOHANG);
+            my $wait_res= waitpid($workers[0],WNOHANG);
             if (!$wait_res) {
                 _print "pid: $_: exited";
             }
@@ -113,7 +115,7 @@ SCOPE: {
 
     while (@pids) {
         @pids= grep { 
-            !waitpid($worker,WNOHANG)
+            !waitpid($workers[0],WNOHANG)
         } @pids;
     }
 

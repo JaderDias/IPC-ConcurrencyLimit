@@ -17,10 +17,6 @@ sub new {
     croak( __PACKAGE__ . " only supports 'Flock' for now")
         if $type ne 'Flock';
 
-    if (defined $params{max_procs} and $params{max_procs}!=1) {
-        croak( __PACKAGE__ . " does not support max_procs!=1, use multiple objects instead.");
-    }
-
     my $process_name_change= $params{process_name_change} || 0;
     my $path=        $params{path}          || die __PACKAGE__ . '->new: missing mandatory parameter `path`';
     my $file_prefix= $params{file_prefix}   || "";
@@ -29,6 +25,7 @@ sub new {
     my $timeout=     $params{timeout}       || undef;
     my $debug=       $params{debug}         || 0; # show debug?
     my $debug_sub=   $params{debug_sub}     || undef;
+    my $max_procs=   $params{max_procs}     || 1;
 
     my $retry_sub= (ref $retries)     ? $retries :
                    (defined $retries &&
@@ -37,11 +34,12 @@ sub new {
                    (defined $timeout) ? sub { $_[2] <= $timeout } :
                                         sub { 1 };
 
-    # primary is replace by standby1, is replaced by
+    # working processes are replaced by standby1, is replaced by
     # standby2, is replaced by standby3. However, standby1
-    # will exit when standby2's lock is held by another process.
+    # will exit when standby($max_procs + 1)'s lock is held by another process.
     my @names= map { ($file_prefix ? "$file_prefix.$_" : $_) }
-                     qw(primary standby1 standby2 standby3);
+                     map("working$_", 1..$max_procs),
+                     map("standby$_", 1..($max_procs + 2));
     my @lockers= map {
         IPC::ConcurrencyLimit->new(
             type => $type,
@@ -60,6 +58,7 @@ sub new {
         retries     => $retries,    # FYI
         lock_name   => \@names,
         locker      => \@lockers,
+        max_procs   => $max_procs,
         debug       => $debug,
         debug_sub   => $debug_sub || sub { warn @_,"\n" },
         retry_sub   => $retry_sub,
@@ -85,10 +84,11 @@ sub get_lock {
 
     my $old_oh= $0;
 
+
     $0 = "$old_oh - acquire"
         if $self->{process_name_change};
 
-    # try to get the rightmost lock (standby3) if we don't get it
+    # try to get the rightmost lock (standby($max_procs + 2)) if we don't get it
     # then we exit out. this shouldn't really happen if other things
     # are sane, for instance when $poll_time is much smaller than
     # the rate we allocate new workers.
@@ -114,22 +114,29 @@ sub get_lock {
     my $lock_tries= 0;
     my $standby_start= time();
     my $lock_start= time();
+    my $max_procs= $self->{max_procs};
     my $poll_time= $self->{poll_time};
 
-    while ( $locker_id > 0 ) {
+    LOCKER:
+    while ( $locker_id >= $max_procs ) {
         $0 = "$old_oh - $names->[$locker_id]"
             if $self->{process_name_change};
 
-        # can we shuffle our lock left?
-        if ( $locker->[$locker_id - 1]->get_lock() ) {
-            $self->_diag( "Got a $names->[$locker_id -1] lock, dropping old $names->[$locker_id] lock")
-                if $self->{debug};
-            # yep, we got the lock to the left, so drop our old lock,
-            # and move the pointer left at the same time.
-            $locker->[ $locker_id-- ]->release_lock();
-            $lock_tries= 0;
-            $lock_start= time();
-            next;
+        # when max_procs > 1 we have to test every working locker
+        my $leftmost = ( $locker_id == $max_procs ) ? 0 : $locker_id - 1;
+        for my $left_locker_id ( $leftmost..($locker_id - 1) ) {
+            # can we shuffle our lock left?
+            if ( $locker->[$left_locker_id]->get_lock() ) {
+                $self->_diag( "Got a $names->[$left_locker_id] lock, dropping old $names->[$locker_id] lock")
+                    if $self->{debug};
+                # yep, we got the lock to the left, so drop our old lock,
+                # and move the pointer left at the same time.
+                $locker->[ $locker_id ]->release_lock();
+                $locker_id = $left_locker_id;
+                $lock_tries= 0;
+                $lock_start= time();
+                next LOCKER;
+            }
         }
 
         unless ($self->{retry_sub}->(++$tries, ++$lock_tries, time - $standby_start, time - $lock_start)) {
@@ -139,16 +146,18 @@ sub get_lock {
         }
 
         # check if we are the first standby worker.
-        if ( $locker_id == 1 ) {
+        if ( $locker_id == $max_procs ) {
+            my $right_locker_id = $locker_id + $max_procs;
+
             # yep - we are the first standby worker,
             # so check if the lock to our right is being held:
-            if ( $locker->[$locker_id + 1]->get_lock() ) {
+            if ( $locker->[$right_locker_id]->get_lock() ) {
                 # we got the lock, which means nothing else
                 # holds it. so we release the lock and move on.
-                $locker->[$locker_id + 1]->release_lock();
+                $locker->[$right_locker_id]->release_lock();
             } else {
                 $self->_diag(
-                    "A newer worker is holding the $names->[$locker_id+1] lock, will exit to let it take over"
+                    "A newer worker is holding the $names->[$right_locker_id] lock, will exit to let it take over"
                 ) if $self->{debug};
                 # we failed to get the lock, which means there is a newer
                 # process that can replace us so return/exit - this frees up
@@ -165,12 +174,12 @@ sub get_lock {
         # that lock holder 1 and lock holder 3 poll lock 2 at the same time
         # forever. The formula guarantees that items to the left poll faster,
         # and the rand ensures there is jitter.
-        sleep rand(($poll_time / $locker_id)*2);
+        sleep rand(($poll_time / (1 + $locker_id - $max_procs)) * 2);
     }
 
     # assert that $locker_id is 0 at this point.
-    die "panic: We should not reach this point with \$locker_id larger than 0, got $locker_id"
-        if $locker_id;
+    die "panic: We should not reach this point with \$locker_id larger than ($max_procs - 1), got $locker_id"
+        if $locker_id > ($max_procs - 1);
 
     $self->_diag("Got $names->[$locker_id] lock, we are allowed to do work.")
         if $self->{debug};
@@ -272,7 +281,7 @@ be reasonably "fresh".
 
 C<IPC::ConcurrencyLimit::WithLatestStandby> does not accept all the regular
 C<IPC::ConcurrencyLimit> options. Currently it is restricted to using
-Flock internally, and max_procs may only be set to 1. There are also additional
+Flock internally. There are also additional
 parameters which may be supplied.
 
 =over 4
